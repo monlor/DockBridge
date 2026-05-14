@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: write
+
+jobs:
+  build-assets:
+    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build release asset
+        env:
+          VERSION: ${{ github.event.release.tag_name }}
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" \
+            go build \
+              -trimpath \
+              -ldflags "-s -w -X dockbridge/internal/command.defaultVersion=${VERSION}" \
+              -o dist/dockerbridge \
+              ./cmd/dockerbridge
+          chmod +x dist/dockerbridge
+          tar -czf "dist/dockerbridge_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz" -C dist dockerbridge
+          sha256sum "dist/dockerbridge_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz" > "dist/dockerbridge_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz.sha256"
+
+      - name: Attach assets to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/dockerbridge_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
+            dist/dockerbridge_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz.sha256
+          overwrite_files: true
