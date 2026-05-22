@@ -2,9 +2,8 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$SCRIPT_DIR"
 OS="$(uname -s)"
 ARCH=""
 MUTAGEN_PLATFORM=""
@@ -16,6 +15,7 @@ SKIP_SSH_CHECK=0
 OUTPUT_SUMMARY=""
 CONTEXT_NAME="dockbridge-remote"
 CONTEXT_NAME_EXPLICIT=0
+USE_EXISTING_CONTEXT=0
 SERVER_NAME=""
 SSH_HOST=""
 SSH_PORT=""
@@ -26,6 +26,7 @@ DOCKER_HOST=""
 DOCKBRIDGE_INSTALL_PATH=""
 DOCKBRIDGE_INSTALL_SOURCE="not installed"
 SHELL_ALIAS_STATUS="not needed"
+DOCKER_COMMAND_ALIAS_ENABLED=0
 
 log_info() {
   printf '[info] %s\n' "$*"
@@ -55,7 +56,7 @@ dry_run_cmd() {
 
 usage() {
   cat <<'USAGE'
-Usage: onboard-dockbridge.sh [options]
+Usage: install.sh [options]
 
 Options:
   --help                 Show this help text.
@@ -179,6 +180,31 @@ ask_yes_no() {
         log_warn "Please answer y or n."
         ;;
     esac
+  done
+}
+
+ask_choice() {
+  local prompt="$1"
+  shift
+  local options=("$@")
+  local answer=""
+  local index=1
+
+  while true; do
+    printf '%s\n' "$prompt" >&2
+    for option in "${options[@]}"; do
+      printf '  %s) %s\n' "$index" "$option" >&2
+      index=$((index + 1))
+    done
+
+    read -r -p "Choose [1-${#options[@]}]: " answer
+    if [[ "$answer" =~ ^[0-9]+$ ]] && [[ "$answer" -ge 1 ]] && [[ "$answer" -le "${#options[@]}" ]]; then
+      printf '%s\n' "$answer"
+      return
+    fi
+
+    log_warn "Please enter a number between 1 and ${#options[@]}."
+    index=1
   done
 }
 
@@ -556,6 +582,9 @@ default_shell_alias_file() {
 shell_alias_block() {
   printf '# >>> dockbridge shell alias >>>\n'
   printf "alias dockerbridge='%s'\n" "$DOCKBRIDGE_INSTALL_PATH"
+  if [[ "$DOCKER_COMMAND_ALIAS_ENABLED" == "1" ]]; then
+    printf "alias docker='dockerbridge'\n"
+  fi
   printf '# <<< dockbridge shell alias <<<\n'
 }
 
@@ -603,6 +632,12 @@ configure_dockbridge_shell_alias() {
   fi
 
   alias_file="$(default_shell_alias_file)"
+  if [[ "$(ask_yes_no "Also alias docker to dockerbridge?")" == "0" ]]; then
+    DOCKER_COMMAND_ALIAS_ENABLED=1
+  else
+    DOCKER_COMMAND_ALIAS_ENABLED=0
+  fi
+
   if [[ "$(ask_yes_no "Write the alias to $alias_file now?")" == "0" ]]; then
     if [[ "$DRY_RUN" == "0" ]]; then
       mkdir -p "$(dirname "$alias_file")"
@@ -759,6 +794,14 @@ resolve_docker_host() {
   fi
 }
 
+docker_context_host() {
+  local context_name="$1"
+  local inspect_output
+
+  inspect_output="$(docker context inspect "$context_name" 2>/dev/null)" || return 1
+  printf '%s\n' "$inspect_output" | tr -d '\n' | sed -n 's/.*"Host"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+}
+
 ensure_docker_for_context() {
   if need_command docker; then
     return
@@ -773,10 +816,91 @@ ensure_docker_for_context() {
   exit 1
 }
 
+choose_context_setup_mode() {
+  local choice
+
+  if [[ "$DRY_RUN" == "1" ]] && ! need_command docker; then
+    log_warn "docker is unavailable in dry-run mode; skipping existing context discovery."
+    USE_EXISTING_CONTEXT=0
+    return
+  fi
+
+  ensure_docker_for_context
+
+  choice="$(ask_choice \
+    'How should DockBridge connect to Docker?' \
+    'Use existing SSH Docker context' \
+    'Create new SSH-backed Docker context'
+  )"
+
+  if [[ "$choice" == "1" ]]; then
+    USE_EXISTING_CONTEXT=1
+  else
+    USE_EXISTING_CONTEXT=0
+  fi
+}
+
+select_existing_ssh_context() {
+  local context_names=()
+  local ssh_context_names=()
+  local ssh_context_hosts=()
+  local context_name context_host choice index
+
+  while IFS= read -r context_name; do
+    [[ -n "$context_name" ]] || continue
+    context_names+=("$context_name")
+  done < <(docker context ls --format '{{.Name}}')
+
+  for context_name in "${context_names[@]}"; do
+    context_host="$(docker_context_host "$context_name" || true)"
+    if [[ "$context_host" == ssh://* ]]; then
+      ssh_context_names+=("$context_name")
+      ssh_context_hosts+=("$context_host")
+    fi
+  done
+
+  if [[ "${#ssh_context_names[@]}" -eq 0 ]]; then
+    log_warn "No existing SSH Docker contexts found. Falling back to new context creation."
+    USE_EXISTING_CONTEXT=0
+    return 1
+  fi
+
+  printf 'Available SSH Docker contexts:\n'
+  for index in "${!ssh_context_names[@]}"; do
+    printf '  %s) %s -> %s\n' "$((index + 1))" "${ssh_context_names[$index]}" "${ssh_context_hosts[$index]}"
+  done
+
+  while true; do
+    read -r -p "Select SSH Docker context [1-${#ssh_context_names[@]}]: " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "${#ssh_context_names[@]}" ]]; then
+      break
+    fi
+    log_warn "Please enter a number between 1 and ${#ssh_context_names[@]}."
+  done
+
+  CONTEXT_NAME="${ssh_context_names[$((choice - 1))]}"
+  DOCKER_HOST="${ssh_context_hosts[$((choice - 1))]}"
+  log_info "Selected existing SSH Docker context '$CONTEXT_NAME'."
+  return 0
+}
+
 manage_context() {
   local existing=0
 
   ensure_docker_for_context
+
+  if [[ "$USE_EXISTING_CONTEXT" == "1" ]]; then
+    if ! select_existing_ssh_context; then
+      manage_context
+      return
+    fi
+
+    if [[ "$(ask_yes_no "Use context '$CONTEXT_NAME' now?")" == "0" ]]; then
+      dry_run_cmd docker context use "$CONTEXT_NAME"
+      log_info "Active context set to '$CONTEXT_NAME'."
+    fi
+    return
+  fi
 
   if need_command docker; then
     if docker context inspect "$CONTEXT_NAME" >/dev/null 2>&1; then
@@ -815,13 +939,13 @@ write_summary() {
     printf 'OS: %s\n' "$OS"
     printf 'Architecture: %s\n' "${ARCH:-unknown}"
     printf 'Mutagen platform: %s\n' "${MUTAGEN_PLATFORM:-unknown}"
-    printf 'SSH host: %s\n' "$SSH_HOST"
-    printf 'Server name: %s\n' "$SERVER_NAME"
+    printf 'SSH host: %s\n' "${SSH_HOST:-not used}"
+    printf 'Server name: %s\n' "${SERVER_NAME:-not used}"
     printf 'dockerbridge source: %s\n' "$DOCKBRIDGE_INSTALL_SOURCE"
     printf 'dockerbridge path: %s\n' "${DOCKBRIDGE_INSTALL_PATH:-not installed}"
     printf 'dockerbridge alias: %s\n' "$SHELL_ALIAS_STATUS"
-    printf 'SSH user: %s\n' "$SSH_USER"
-    printf 'SSH port: %s\n' "$SSH_PORT"
+    printf 'SSH user: %s\n' "${SSH_USER:-not used}"
+    printf 'SSH port: %s\n' "${SSH_PORT:-not used}"
     if [[ -n "$SSH_ALIAS" ]]; then
       printf 'SSH alias: %s\n' "$SSH_ALIAS"
     else
@@ -909,9 +1033,7 @@ main() {
     log_info "Running in dry-run mode"
   fi
 
-  if [[ "$SCRIPT_NAME" == "onboard-dockbridge.sh" ]]; then
-    log_info "Starting DockBridge onboarding for $OS"
-  fi
+  log_info "Starting DockBridge onboarding for $OS"
 
   assert_dependencies
   resolve_platform
@@ -919,8 +1041,11 @@ main() {
   install_mutagen
   install_dockbridge
   configure_dockbridge_shell_alias
-  collect_ssh_info
-  resolve_docker_host
+  choose_context_setup_mode
+  if [[ "$USE_EXISTING_CONTEXT" == "0" ]]; then
+    collect_ssh_info
+    resolve_docker_host
+  fi
   manage_context
   run_post_checks
   write_summary

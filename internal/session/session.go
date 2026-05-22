@@ -17,6 +17,7 @@ type Session struct {
 	LocalRoot       string        `json:"localRoot"`
 	RemoteTarget    string        `json:"remoteTarget"`
 	RemoteWorkspace string        `json:"remoteWorkspace"`
+	AutoRemove      bool          `json:"autoRemove,omitempty"`
 	Syncs           []SyncState   `json:"syncs,omitempty"`
 	Tunnels         []TunnelState `json:"tunnels,omitempty"`
 	GeneratedFiles  []string      `json:"generatedFiles,omitempty"`

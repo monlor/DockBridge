@@ -5,10 +5,10 @@ SSH-backed remote Docker hosts.
 
 ## Quick Start (Onboarding)
 
-The recommended first-run path is the onboarding script:
+The recommended first-run path is the install script:
 
 ```bash
-./scripts/onboard-dockbridge.sh
+./install.sh
 ```
 
 The script is optimized for macOS first and includes best-effort Linux support.
@@ -18,13 +18,13 @@ It can:
 2. install `mutagen`
 3. install the `dockerbridge` command locally
 4. offer a shell alias when the install directory is not already in `PATH`
-5. collect SSH target information
+5. reuse an existing SSH-backed Docker context or collect SSH target information
 6. create and optionally activate a Docker context for the remote daemon
 
 Use dry-run mode if you want to preview every command first:
 
 ```bash
-./scripts/onboard-dockbridge.sh --dry-run
+./install.sh --dry-run
 ```
 
 `--dry-run` prints the install, SSH, and Docker context actions it would take
@@ -48,11 +48,13 @@ Common options:
 Example:
 
 ```bash
-./scripts/onboard-dockbridge.sh --context-name local-dockbridge --output /tmp/onboard.txt
+./install.sh --context-name local-dockbridge --output /tmp/onboard.txt
 ```
 
-During onboarding, the server name becomes the default SSH alias and Docker
-context name unless you override the context with `--context-name`.
+During setup, you can either pick an existing Docker context whose Docker host
+uses `ssh://` or create a new SSH-backed context. When you create a new
+context, the server name becomes the default SSH alias and Docker context name
+unless you override the context with `--context-name`.
 
 ## Manual Installation
 

@@ -130,6 +130,32 @@ func TestLoadConfigUsesCurrentDockerContext(t *testing.T) {
 	}
 }
 
+func TestLoadConfigKeepsNonSSHContextHost(t *testing.T) {
+	cfg, err := Load(Options{
+		Env:     map[string]string{},
+		HomeDir: "/Users/me",
+		Lookup:  func(string) (string, error) { return "/bin/docker", nil },
+		ContextHost: func(realDocker string) (string, error) {
+			if realDocker != "/bin/docker" {
+				t.Fatalf("ContextHost realDocker = %q", realDocker)
+			}
+			return "tcp://docker.example.com:2376", nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RemoteDockerHost != "tcp://docker.example.com:2376" {
+		t.Fatalf("RemoteDockerHost = %q", cfg.RemoteDockerHost)
+	}
+	if cfg.IsSSHRemote() {
+		t.Fatal("non-ssh context should not be marked as ssh")
+	}
+	if cfg.RemoteWorkspaceRoot != "/tmp/dockbridge/workspaces" {
+		t.Fatalf("RemoteWorkspaceRoot = %q", cfg.RemoteWorkspaceRoot)
+	}
+}
+
 func TestLoadConfigEnvRemoteOverridesCurrentDockerContext(t *testing.T) {
 	cfg, err := Load(Options{
 		Env: map[string]string{

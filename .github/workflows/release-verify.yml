@@ -84,6 +84,11 @@ jobs:
 
       - name: Verify onboarding and Go tests
         run: |
-          bash -n scripts/onboard-dockbridge.sh
+          bash -n install.sh
           bash scripts/test-onboard-dockbridge.sh
+          grep -Fq 'releases/latest/download/dockerbridge_%s.tar.gz' install.sh
+          grep -Fq 'dockerbridge_darwin_amd64.tar.gz' README.md
+          grep -Fq 'dockerbridge_darwin_arm64.tar.gz' README.md
+          grep -Fq 'dockerbridge_linux_amd64.tar.gz' README.md
+          grep -Fq 'dockerbridge_linux_arm64.tar.gz' README.md
           go test ./...

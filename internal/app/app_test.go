@@ -663,7 +663,7 @@ func TestDockerbridgeSessionsHelp(t *testing.T) {
 	}
 }
 
-func TestDockerbridgeSessionsCleanupPurgesAllSessionsWithoutDocker(t *testing.T) {
+func TestDockerbridgeSessionsCleanupPurgesOnlySessionsWithoutContainers(t *testing.T) {
 	state := t.TempDir()
 	store := session.NewStore(state)
 	generated := filepath.Join(t.TempDir(), "compose.yml")
@@ -697,6 +697,18 @@ func TestDockerbridgeSessionsCleanupPurgesAllSessionsWithoutDocker(t *testing.T)
 		LocalRoot:       "/Users/me/project-b",
 		RemoteTarget:    "ssh://dev-b",
 		RemoteWorkspace: "/srv/dockbridge/sess-b",
+		Syncs: []session.SyncState{{
+			ID:         "sync-2",
+			RemotePath: "/srv/dockbridge/sess-b/app",
+			Active:     true,
+		}},
+		Tunnels: []session.TunnelState{{
+			ID:         "tunnel-2",
+			LocalBind:  "127.0.0.1",
+			LocalPort:  3001,
+			RemotePort: 49153,
+			Active:     true,
+		}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -711,7 +723,13 @@ func TestDockerbridgeSessionsCleanupPurgesAllSessionsWithoutDocker(t *testing.T)
 		SessionStore:    store,
 		RemoteCleaner:   cleaner,
 		RemoteValidator: failingValidator{},
-		Output:          &out,
+		ContainerTracker: recordingContainerTracker{
+			containers: []ContainerMetadata{{
+				ID:         "container-123",
+				MountPaths: []string{"/srv/dockbridge/sess-b/app"},
+			}},
+		},
+		Output: &out,
 		MutagenTerminator: func(_ context.Context, _ string, name string) error {
 			if name != "dockbridge-sync-a" {
 				t.Fatalf("unexpected mutagen name %q", name)
@@ -740,7 +758,7 @@ func TestDockerbridgeSessionsCleanupPurgesAllSessionsWithoutDocker(t *testing.T)
 	if tunnels.ActiveCount() != 0 {
 		t.Fatalf("cleanup should leave no active memory tunnels")
 	}
-	if len(cleaner.paths) != 2 {
+	if len(cleaner.paths) != 1 {
 		t.Fatalf("remote cleanup paths = %+v", cleaner.paths)
 	}
 	if _, err := os.Stat(generated); !errors.Is(err, os.ErrNotExist) {
@@ -749,10 +767,71 @@ func TestDockerbridgeSessionsCleanupPurgesAllSessionsWithoutDocker(t *testing.T)
 	if _, err := store.Load("sess-a"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("sess-a should be deleted, got %v", err)
 	}
-	if _, err := store.Load("sess-b"); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("sess-b should be deleted, got %v", err)
+	loaded, err := store.Load("sess-b")
+	if err != nil {
+		t.Fatalf("sess-b should remain, got %v", err)
 	}
-	if !strings.Contains(out.String(), "Cleaned 2 DockBridge session(s)") {
+	if len(loaded.Syncs) != 1 || !loaded.Syncs[0].Active {
+		t.Fatalf("sess-b should remain active: %+v", loaded.Syncs)
+	}
+	if !strings.Contains(out.String(), "Cleaned 1 DockBridge session(s)") || !strings.Contains(out.String(), "Skipped 1 active DockBridge session(s)") {
+		t.Fatalf("cleanup output mismatch: %s", out.String())
+	}
+}
+
+func TestDockerbridgeSessionsCleanupKeepsSessionsReferencedByPublishedPorts(t *testing.T) {
+	state := t.TempDir()
+	store := session.NewStore(state)
+	if err := store.Save(session.Session{
+		ID:              "sess-a",
+		LocalRoot:       "/Users/me/project-a",
+		RemoteTarget:    "ssh://dev-a",
+		RemoteWorkspace: "/srv/dockbridge/sess-a",
+		Tunnels: []session.TunnelState{{
+			ID:         "tunnel-1",
+			LocalBind:  "127.0.0.1",
+			LocalPort:  3000,
+			RemotePort: 49152,
+			Active:     true,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cleaner := &recordingRemoteCleaner{}
+	var out bytes.Buffer
+	a := App{
+		SessionStore:  store,
+		RemoteCleaner: cleaner,
+		ContainerTracker: recordingContainerTracker{
+			containers: []ContainerMetadata{{
+				ID:             "container-123",
+				PublishedPorts: []int{49152},
+			}},
+		},
+		Output: &out,
+	}
+	err := a.Run(context.Background(), Invocation{
+		Entrypoint: "dockerbridge",
+		Args:       []string{"sessions", "cleanup"},
+		Env:        map[string]string{},
+		Config: config.Config{
+			RealDockerPath:      "/bin/docker",
+			RemoteDockerHost:    "ssh://dev",
+			StateDir:            state,
+			RemoteWorkspaceRoot: "/srv/dockbridge",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cleaner.paths) != 0 {
+		t.Fatalf("active port-backed session should not be cleaned: %+v", cleaner.paths)
+	}
+	if _, err := store.Load("sess-a"); err != nil {
+		t.Fatalf("sess-a should remain, got %v", err)
+	}
+	if !strings.Contains(out.String(), "Cleaned 0 DockBridge session(s)") || !strings.Contains(out.String(), "Skipped 1 active DockBridge session(s)") {
 		t.Fatalf("cleanup output mismatch: %s", out.String())
 	}
 }
@@ -775,6 +854,66 @@ func TestDockerEntrypointDoesNotExposeNativeSessionsCommand(t *testing.T) {
 	}
 	if len(exec.Calls) != 0 {
 		t.Fatalf("unsupported docker sessions should not invoke docker: %+v", exec.Calls)
+	}
+}
+
+func TestNativeSessionsRequiresSSHRemoteHost(t *testing.T) {
+	state := t.TempDir()
+	a := App{SessionStore: session.NewStore(state)}
+	err := a.Run(context.Background(), Invocation{
+		Entrypoint: "dockerbridge",
+		Args:       []string{"sessions"},
+		Env:        map[string]string{},
+		Config: config.Config{
+			RealDockerPath:      "/bin/docker",
+			RemoteDockerHost:    "tcp://docker.example.com:2376",
+			RemoteWorkspaceRoot: "/srv/dockbridge",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "requires an ssh:// Docker host") {
+		t.Fatalf("expected non-ssh sessions error, got %v", err)
+	}
+}
+
+func TestDockerRunWithNonSSHRemoteSkipsSyncAndTunnelTranslation(t *testing.T) {
+	cwd := t.TempDir()
+	state := t.TempDir()
+	exec := &RecordingExecutor{}
+	syncDriver := &recordingSyncDriver{status: dbsync.Status{Active: true}}
+	tunnels := ports.NewMemoryTunnelManager()
+	a := App{
+		Executor:        exec,
+		SyncDriver:      syncDriver,
+		TunnelStarter:   tunnels,
+		SessionStore:    session.NewStore(state),
+		RemotePortStart: 49152,
+		PortAvailable:   func(string, int) bool { return true },
+	}
+	err := a.Run(context.Background(), Invocation{
+		Entrypoint: "docker",
+		Args:       []string{"run", "-v", ".:/app", "-p", "3000:80", "nginx"},
+		Env:        map[string]string{},
+		Cwd:        cwd,
+		Config: config.Config{
+			RealDockerPath:      "/bin/docker",
+			RemoteDockerHost:    "tcp://docker.example.com:2376",
+			StateDir:            state,
+			LocalBindAddress:    "127.0.0.1",
+			RemoteWorkspaceRoot: "/remote",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(syncDriver.projections) != 0 {
+		t.Fatalf("non-ssh run should not start syncs: %+v", syncDriver.projections)
+	}
+	if tunnels.ActiveCount() != 0 {
+		t.Fatalf("non-ssh run should not start tunnels")
+	}
+	got := strings.Join(exec.Calls[0].Args, " ")
+	if got != "-H tcp://docker.example.com:2376 run -v .:/app -p 3000:80 nginx" {
+		t.Fatalf("args = %q", got)
 	}
 }
 
@@ -1128,6 +1267,7 @@ func TestInteractiveDockerRunSuccessfulExitKeepsResourcesWhenContainerRunning(t 
 
 func TestInteractiveDockerRunWithRemovedContainerCleansResources(t *testing.T) {
 	cwd := t.TempDir()
+	remote := t.TempDir()
 	state := t.TempDir()
 	userCIDFile := filepath.Join(t.TempDir(), "container.cid")
 	if err := os.WriteFile(userCIDFile, []byte("container-123\n"), 0o600); err != nil {
@@ -1136,6 +1276,7 @@ func TestInteractiveDockerRunWithRemovedContainerCleansResources(t *testing.T) {
 	store := session.NewStore(state)
 	exec := &RecordingExecutor{}
 	tunnels := ports.NewMemoryTunnelManager()
+	cleaner := &recordingRemoteCleaner{}
 	syncDriver := &recordingSyncDriver{status: dbsync.Status{
 		Backend:           "mutagen",
 		MutagenName:       "dockbridge-sync",
@@ -1149,10 +1290,12 @@ func TestInteractiveDockerRunWithRemovedContainerCleansResources(t *testing.T) {
 		SyncDriver:         syncDriver,
 		TunnelStarter:      tunnels,
 		SessionStore:       store,
+		RemoteCleaner:      cleaner,
 		ContainerInspector: recordingContainerInspector{err: os.ErrNotExist},
 		RemotePortStart:    49152,
 		PortAvailable:      func(string, int) bool { return true },
 	}
+	id := session.Identity(cwd, "ssh://dev", filepath.Base(cwd))
 	err := a.Run(context.Background(), Invocation{
 		Entrypoint: "docker",
 		Args:       []string{"run", "--rm", "-it", "--cidfile", userCIDFile, "-v", ".:/app", "-p", "3000:80", "nginx"},
@@ -1163,7 +1306,7 @@ func TestInteractiveDockerRunWithRemovedContainerCleansResources(t *testing.T) {
 			RemoteDockerHost:    "ssh://dev",
 			StateDir:            state,
 			LocalBindAddress:    "127.0.0.1",
-			RemoteWorkspaceRoot: "/remote",
+			RemoteWorkspaceRoot: remote,
 		},
 	})
 	if err != nil {
@@ -1177,6 +1320,70 @@ func TestInteractiveDockerRunWithRemovedContainerCleansResources(t *testing.T) {
 	}
 	if _, err := os.Stat(userCIDFile); err != nil {
 		t.Fatalf("user cidfile should be preserved: %v", err)
+	}
+	if len(cleaner.paths) != 1 || cleaner.paths[0] != session.WorkspacePath(remote, id) {
+		t.Fatalf("remote workspace cleanup mismatch: %+v", cleaner.paths)
+	}
+	if _, err := store.Load(id); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("auto-remove run should delete session, got %v", err)
+	}
+}
+
+func TestDockerStopPurgesAutoRemoveManagedSession(t *testing.T) {
+	cwd := t.TempDir()
+	remote := t.TempDir()
+	state := t.TempDir()
+	exec := &RecordingExecutor{}
+	tunnels := ports.NewMemoryTunnelManager()
+	store := session.NewStore(state)
+	cleaner := &recordingRemoteCleaner{}
+	a := App{
+		Executor:        exec,
+		SyncDriver:      dbsync.LocalMirrorDriver{},
+		TunnelStarter:   tunnels,
+		SessionStore:    store,
+		RemoteCleaner:   cleaner,
+		RemotePortStart: 49152,
+		PortAvailable:   func(string, int) bool { return true },
+	}
+	cfg := config.Config{
+		RealDockerPath:      "/bin/docker",
+		RemoteDockerHost:    "ssh://dev",
+		StateDir:            state,
+		LocalBindAddress:    "127.0.0.1",
+		RemoteWorkspaceRoot: remote,
+	}
+	if err := a.Run(context.Background(), Invocation{
+		Entrypoint: "docker",
+		Args:       []string{"run", "-d", "--rm", "-v", ".:/app", "-p", "3000:80", "nginx"},
+		Env:        map[string]string{},
+		Cwd:        cwd,
+		Config:     cfg,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	id := session.Identity(cwd, "ssh://dev", filepath.Base(cwd))
+	loaded, err := store.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Run(context.Background(), Invocation{
+		Entrypoint: "docker",
+		Args:       []string{"stop", "container-id"},
+		Env:        map[string]string{},
+		Cwd:        cwd,
+		Config:     cfg,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if tunnels.ActiveCount() != 0 {
+		t.Fatalf("stop should stop managed tunnel")
+	}
+	if len(cleaner.paths) != 1 || cleaner.paths[0] != loaded.RemoteWorkspace {
+		t.Fatalf("remote workspace cleanup mismatch: %+v want %q", cleaner.paths, loaded.RemoteWorkspace)
+	}
+	if _, err := store.Load(id); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("auto-remove session should be deleted after stop, got %v", err)
 	}
 }
 
@@ -1787,10 +1994,12 @@ func TestDockerRunInteractiveUsesSharedTerminalProcessGroup(t *testing.T) {
 	cwd := t.TempDir()
 	state := t.TempDir()
 	exec := &RecordingExecutor{}
+	cleaner := &recordingRemoteCleaner{}
 	a := App{
 		Executor:        exec,
 		TunnelStarter:   ports.NewMemoryTunnelManager(),
 		SessionStore:    session.NewStore(state),
+		RemoteCleaner:   cleaner,
 		RemotePortStart: 49152,
 		PortAvailable:   func(string, int) bool { return true },
 	}
@@ -1819,10 +2028,12 @@ func TestDockerRunNonInteractiveUsesManagedProcessGroup(t *testing.T) {
 	cwd := t.TempDir()
 	state := t.TempDir()
 	exec := &RecordingExecutor{}
+	cleaner := &recordingRemoteCleaner{}
 	a := App{
 		Executor:        exec,
 		TunnelStarter:   ports.NewMemoryTunnelManager(),
 		SessionStore:    session.NewStore(state),
+		RemoteCleaner:   cleaner,
 		RemotePortStart: 49152,
 		PortAvailable:   func(string, int) bool { return true },
 	}
@@ -2035,6 +2246,15 @@ type recordingContainerInspector struct {
 
 func (r recordingContainerInspector) Running(_ context.Context, _ config.Config, _ string) (bool, error) {
 	return r.running, r.err
+}
+
+type recordingContainerTracker struct {
+	containers []ContainerMetadata
+	err        error
+}
+
+func (r recordingContainerTracker) List(_ context.Context, _ config.Config) ([]ContainerMetadata, error) {
+	return r.containers, r.err
 }
 
 type cancelingExecutor struct {

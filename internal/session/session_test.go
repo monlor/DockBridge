@@ -28,6 +28,7 @@ func TestStoreSaveLoadAndCleanup(t *testing.T) {
 		LocalRoot:       "/Users/me/project",
 		RemoteTarget:    "ssh://dev",
 		RemoteWorkspace: "/srv/dockbridge/abc",
+		AutoRemove:      true,
 		Syncs:           []SyncState{{ID: "sync-1", LocalPath: "/local", RemotePath: "/remote", Active: true, Backend: "mutagen", MutagenName: "dockbridge-abc", MutagenIdentifier: "sync_abc", LastStatus: "Watching for changes"}},
 		Tunnels:         []TunnelState{{ID: "tunnel-1", LocalBind: "127.0.0.1", LocalPort: 3000, RemotePort: 49152, Active: true}},
 		GeneratedFiles:  []string{"/tmp/generated.yml"},
@@ -40,7 +41,7 @@ func TestStoreSaveLoadAndCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.RemoteWorkspace != s.RemoteWorkspace || len(loaded.Syncs) != 1 || len(loaded.Tunnels) != 1 {
+	if loaded.RemoteWorkspace != s.RemoteWorkspace || !loaded.AutoRemove || len(loaded.Syncs) != 1 || len(loaded.Tunnels) != 1 {
 		t.Fatalf("loaded session mismatch: %+v", loaded)
 	}
 

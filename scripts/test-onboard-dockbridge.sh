@@ -3,7 +3,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-TARGET_SCRIPT="$ROOT_DIR/scripts/onboard-dockbridge.sh"
+TARGET_SCRIPT="$ROOT_DIR/install.sh"
 
 fail() {
   printf '[fail] %s\n' "$*" >&2
@@ -99,8 +99,45 @@ set -euo pipefail
 log_path="${DOCKER_LOG:?DOCKER_LOG is required}"
 printf '%s\n' "$*" >> "$log_path"
 
+if [[ "${1:-}" == "context" && "${2:-}" == "ls" ]]; then
+  printf '%s' "${DOCKER_CONTEXT_LS_OUTPUT:-}"
+  exit 0
+fi
+
 if [[ "${1:-}" == "context" && "${2:-}" == "inspect" ]]; then
-  exit 1
+  case "${3:-}" in
+    ssh-prod)
+      cat <<'JSON'
+[
+  {
+    "Endpoints": {
+      "docker": {
+        "Host": "ssh://prod@example.com:22"
+      }
+    }
+  }
+]
+JSON
+      exit 0
+      ;;
+    tcp-prod)
+      cat <<'JSON'
+[
+  {
+    "Endpoints": {
+      "docker": {
+        "Host": "tcp://prod.example.com:2376"
+      }
+    }
+  }
+]
+JSON
+      exit 0
+      ;;
+    *)
+      exit 1
+      ;;
+  esac
 fi
 
 exit 0
@@ -207,6 +244,7 @@ run_context_creation_test() {
     DOCKBRIDGE_LOCAL_BIN_DIR="$home_dir/.local/bin" \
     DOCKBRIDGE_LOCAL_BINARY="$local_binary" \
     bash "$TARGET_SCRIPT" --skip-docker-check --skip-mutagen --skip-ssh-check --context-name smoke-context --output "$summary_path" <<'EOF'
+2
 smoke-server
 example.com
 22
@@ -266,6 +304,8 @@ run_shell_alias_persistence_test() {
     bash "$TARGET_SCRIPT" --skip-docker-check --skip-mutagen --skip-ssh-check --context-name alias-context <<'EOF'
 y
 y
+y
+2
 alias-server
 example.com
 22
@@ -279,6 +319,7 @@ EOF
   assert_contains "$result" "DockBridge alias stored in $shell_rc"
   assert_file_contains "$shell_rc" "# >>> dockbridge shell alias >>>"
   assert_file_contains "$shell_rc" "alias dockerbridge='$home_dir/.local/bin/dockerbridge'"
+  assert_file_contains "$shell_rc" "alias docker='dockerbridge'"
   assert_file_contains "$shell_rc" "# <<< dockbridge shell alias <<<"
   assert_file_exists "$home_dir/.local/bin/dockerbridge"
   assert_file_executable "$home_dir/.local/bin/dockerbridge"
@@ -311,6 +352,7 @@ run_interactive_dry_run_does_not_write_files_test() {
 y
 y
 y
+y
 dry-server
 example.com
 22
@@ -331,13 +373,68 @@ EOF
   rm -rf "$tmp_dir"
 }
 
+run_existing_ssh_context_selection_test() {
+  local tmp_dir home_dir bin_dir log_path summary_path local_binary result ssh_config
+
+  tmp_dir="$(mktemp -d)"
+  home_dir="$tmp_dir/home"
+  bin_dir="$tmp_dir/bin"
+  log_path="$tmp_dir/docker.log"
+  summary_path="$tmp_dir/summary.txt"
+  local_binary="$tmp_dir/dockerbridge"
+  ssh_config="$home_dir/.ssh/config"
+
+  mkdir -p "$home_dir/.ssh" "$bin_dir"
+  : > "$home_dir/.ssh/id_ed25519"
+  : > "$log_path"
+  : > "$ssh_config"
+
+  make_fake_uname "$bin_dir"
+  make_fake_docker "$bin_dir"
+  make_fake_mutagen "$bin_dir"
+  make_fake_dockbridge_binary "$local_binary"
+
+  result="$(
+    HOME="$home_dir" \
+    PATH="$bin_dir:/usr/bin:/bin:/usr/sbin:/sbin" \
+    DOCKER_LOG="$log_path" \
+    DOCKER_CONTEXT_LS_OUTPUT=$'ssh-prod\ntcp-prod\n' \
+    DOCKBRIDGE_LOCAL_BIN_DIR="$home_dir/.local/bin" \
+    DOCKBRIDGE_LOCAL_BINARY="$local_binary" \
+    bash "$TARGET_SCRIPT" --skip-docker-check --skip-mutagen --output "$summary_path" <<'EOF'
+1
+1
+y
+EOF
+  )"
+
+  assert_contains "$result" "Available SSH Docker contexts:"
+  assert_contains "$result" "1) ssh-prod -> ssh://prod@example.com:22"
+  assert_contains "$result" "Selected existing SSH Docker context 'ssh-prod'."
+  assert_file_contains "$log_path" "context ls"
+  assert_file_contains "$log_path" "context inspect ssh-prod"
+  assert_file_contains "$log_path" "context inspect tcp-prod"
+  assert_file_contains "$log_path" "context use ssh-prod"
+  if grep -Fq "context create" "$log_path"; then
+    fail "expected existing context selection to skip context creation"
+  fi
+  assert_file_contains "$summary_path" "Docker context: ssh-prod"
+  assert_file_contains "$summary_path" "Docker host: ssh://prod@example.com:22"
+  if [[ -s "$ssh_config" ]]; then
+    fail "expected existing context selection to skip SSH config updates"
+  fi
+
+  rm -rf "$tmp_dir"
+}
+
 main() {
   run_parse_test
   run_dry_run_test
   run_context_creation_test
   run_shell_alias_persistence_test
   run_interactive_dry_run_does_not_write_files_test
-  printf '[pass] onboard-dockbridge smoke tests passed\n'
+  run_existing_ssh_context_selection_test
+  printf '[pass] install.sh smoke tests passed\n'
 }
 
 main "$@"

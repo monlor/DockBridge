@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -127,6 +128,7 @@ type App struct {
 	RemoteCleaner      RemoteWorkspaceCleaner
 	RemoteValidator    RemoteValidator
 	ContainerInspector ContainerInspector
+	ContainerTracker   ContainerTracker
 	Output             io.Writer
 	MutagenTerminator  func(context.Context, string, string) error
 	PortAvailable      func(string, int) bool
@@ -160,6 +162,16 @@ type RemoteWorkspaceCleaner interface {
 
 type ContainerInspector interface {
 	Running(context.Context, config.Config, string) (bool, error)
+}
+
+type ContainerTracker interface {
+	List(context.Context, config.Config) ([]ContainerMetadata, error)
+}
+
+type ContainerMetadata struct {
+	ID             string
+	MountPaths     []string
+	PublishedPorts []int
 }
 
 func (a App) Run(ctx context.Context, inv Invocation) error {
@@ -216,6 +228,13 @@ func (a App) Run(ctx context.Context, inv Invocation) error {
 		}
 		switch dockerLifecycleAction(inv.Args) {
 		case lifecycleSuspend:
+			sess, ok, err := a.loadSessionForInvocation(inv)
+			if err != nil {
+				return err
+			}
+			if ok && sess.AutoRemove {
+				return a.purgeManagedSession(ctx, inv)
+			}
 			return a.suspendManagedSession(ctx, inv)
 		case lifecyclePurge:
 			return a.purgeManagedSession(ctx, inv)
@@ -249,6 +268,9 @@ func validateLocalCommand(classification cli.Classification, args []string) erro
 }
 
 func (a App) runDockerBuild(ctx context.Context, executor Executor, inv Invocation) error {
+	if !inv.Config.IsSSHRemote() {
+		return executor.Run(ctx, Call{Name: inv.Config.RealDockerPath, Args: append([]string{"-H", inv.Config.RemoteDockerHost}, inv.Args...)})
+	}
 	cwd := workingDir(inv.Cwd)
 	sess := a.ensureSession(inv, cwd)
 	contextPath := cli.BuildContext(inv.Args, cwd)
@@ -277,6 +299,12 @@ func (a App) runDockerBuild(ctx context.Context, executor Executor, inv Invocati
 }
 
 func (a App) runCompose(ctx context.Context, executor Executor, inv Invocation) error {
+	if !inv.Config.IsSSHRemote() {
+		return executor.Run(ctx, Call{
+			Name: inv.Config.RealDockerPath,
+			Args: append([]string{"-H", inv.Config.RemoteDockerHost}, inv.Args...),
+		})
+	}
 	cwd := workingDir(inv.Cwd)
 	composeArgs := inv.Args
 	if len(inv.Args) > 0 && inv.Args[0] == "compose" {
@@ -340,6 +368,9 @@ func (a App) runDockerRun(ctx context.Context, executor Executor, inv Invocation
 	if len(inv.Args) == 0 || inv.Args[0] != "run" {
 		return executor.Run(ctx, Call{Name: inv.Config.RealDockerPath, Args: append([]string{"-H", inv.Config.RemoteDockerHost}, inv.Args...)})
 	}
+	if !inv.Config.IsSSHRemote() {
+		return executor.Run(ctx, Call{Name: inv.Config.RealDockerPath, Args: append([]string{"-H", inv.Config.RemoteDockerHost}, inv.Args...)})
+	}
 	cwd := workingDir(inv.Cwd)
 	sess := a.ensureSession(inv, cwd)
 	mounts, err := cli.ParseRunMounts(inv.Args, cwd)
@@ -399,6 +430,7 @@ func (a App) runDockerRun(ctx context.Context, executor Executor, inv Invocation
 	defer interactiveLifecycle.cleanup()
 	sess.Syncs = append(sess.Syncs, syncStates(syncs)...)
 	sess.Tunnels = append(sess.Tunnels, tunnelStates(tunnels)...)
+	sess.AutoRemove = dockerRunAutoRemove(inv.Args)
 	a.saveSession(sess)
 	cleanup := a.startedResourceCleanup(&sess, syncs, tunnels)
 	stopCleanupWatcher := noop
@@ -420,6 +452,9 @@ func (a App) runDockerRun(ctx context.Context, executor Executor, inv Invocation
 		return err
 	}
 	if shouldCleanup {
+		if sess.AutoRemove {
+			return a.purgeStartedManagedSession(ctx, inv.Config, sess, cleanup)
+		}
 		return cleanup()
 	}
 	return nil
@@ -642,6 +677,99 @@ func (DockerContainerInspector) Running(ctx context.Context, cfg config.Config, 
 	return strconv.ParseBool(strings.TrimSpace(string(output)))
 }
 
+type DockerContainerTracker struct{}
+
+func (DockerContainerTracker) List(ctx context.Context, cfg config.Config) ([]ContainerMetadata, error) {
+	output, err := exec.CommandContext(ctx, cfg.RealDockerPath, "-H", cfg.RemoteDockerHost, "ps", "-aq").CombinedOutput()
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: %s", err, message)
+	}
+	containerIDs := strings.Fields(strings.TrimSpace(string(output)))
+	if len(containerIDs) == 0 {
+		return nil, nil
+	}
+	inspectArgs := append([]string{"-H", cfg.RemoteDockerHost, "inspect"}, containerIDs...)
+	inspectOutput, err := exec.CommandContext(ctx, cfg.RealDockerPath, inspectArgs...).CombinedOutput()
+	if err != nil {
+		message := strings.TrimSpace(string(inspectOutput))
+		if message == "" {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: %s", err, message)
+	}
+	var records []struct {
+		ID     string `json:"Id"`
+		Mounts []struct {
+			Source string `json:"Source"`
+		} `json:"Mounts"`
+		HostConfig struct {
+			PortBindings map[string][]struct {
+				HostPort string `json:"HostPort"`
+			} `json:"PortBindings"`
+		} `json:"HostConfig"`
+	}
+	if err := json.Unmarshal(inspectOutput, &records); err != nil {
+		return nil, err
+	}
+	containers := make([]ContainerMetadata, 0, len(records))
+	for _, record := range records {
+		meta := ContainerMetadata{ID: record.ID}
+		for _, mount := range record.Mounts {
+			if mount.Source != "" {
+				meta.MountPaths = append(meta.MountPaths, filepath.ToSlash(path.Clean(mount.Source)))
+			}
+		}
+		for _, bindings := range record.HostConfig.PortBindings {
+			for _, binding := range bindings {
+				port, err := strconv.Atoi(binding.HostPort)
+				if err == nil && port > 0 {
+					meta.PublishedPorts = append(meta.PublishedPorts, port)
+				}
+			}
+		}
+		containers = append(containers, meta)
+	}
+	return containers, nil
+}
+
+func sessionHasContainer(sess session.Session, containers []ContainerMetadata) bool {
+	remotePaths := make([]string, 0, len(sess.Syncs)+1)
+	if sess.RemoteWorkspace != "" {
+		remotePaths = append(remotePaths, filepath.ToSlash(path.Clean(sess.RemoteWorkspace)))
+	}
+	for _, sync := range sess.Syncs {
+		if sync.RemotePath == "" {
+			continue
+		}
+		remotePaths = append(remotePaths, filepath.ToSlash(path.Clean(sync.RemotePath)))
+	}
+	remotePorts := map[int]struct{}{}
+	for _, tunnel := range sess.Tunnels {
+		if tunnel.RemotePort > 0 {
+			remotePorts[tunnel.RemotePort] = struct{}{}
+		}
+	}
+	for _, container := range containers {
+		for _, mountPath := range container.MountPaths {
+			for _, remotePath := range remotePaths {
+				if mountPath == remotePath || strings.HasPrefix(mountPath, remotePath+"/") {
+					return true
+				}
+			}
+		}
+		for _, publishedPort := range container.PublishedPorts {
+			if _, ok := remotePorts[publishedPort]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (a App) suspendStartedResources(sess *session.Session, syncs []startedSync, tunnels []ports.Tunnel) error {
 	ctx, cancel := cleanupContext()
 	defer cancel()
@@ -773,6 +901,28 @@ func (a App) purgeManagedSession(ctx context.Context, inv Invocation) error {
 	return a.SessionStore.Delete(sess.ID)
 }
 
+func (a App) purgeStartedManagedSession(ctx context.Context, cfg config.Config, sess session.Session, cleanup func() error) error {
+	if err := cleanup(); err != nil {
+		return err
+	}
+	cleaner := a.RemoteCleaner
+	if cleaner == nil {
+		cleaner = SSHRemoteWorkspaceCleaner{}
+	}
+	if err := cleaner.Remove(ctx, cfg, sess.RemoteWorkspace); err != nil {
+		return err
+	}
+	for _, generated := range sess.GeneratedFiles {
+		if generated == "" {
+			continue
+		}
+		if err := os.Remove(generated); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return a.SessionStore.Delete(sess.ID)
+}
+
 func (a App) deactivateManagedProcesses(ctx context.Context, cfg config.Config, sess *session.Session, tolerateMissingMutagen bool) error {
 	for i := range sess.Tunnels {
 		if sess.Tunnels[i].Active {
@@ -819,6 +969,9 @@ func (a App) runNativeSessions(ctx context.Context, inv Invocation) error {
 	if a.SessionStore == nil {
 		return errors.New("session store is required")
 	}
+	if !inv.Config.IsSSHRemote() {
+		return errors.New("dockerbridge sessions requires an ssh:// Docker host")
+	}
 	if len(inv.Args) == 1 || inv.Args[1] == "list" {
 		return a.listSessions()
 	}
@@ -836,7 +989,7 @@ func (a App) printSessionsHelp() error {
 
 Commands:
   list      Show tracked DockBridge sessions with sync and tunnel counts.
-  cleanup   Stop tracked tunnels and Mutagen syncs, remove remote caches, and delete session state.
+  cleanup   Clean only sessions whose projected mounts and forwarded ports are not referenced by any remote container.
 `)
 	return err
 }
@@ -876,16 +1029,36 @@ func (a App) cleanupSessions(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return err
 	}
+	tracker := a.ContainerTracker
+	if tracker == nil {
+		tracker = DockerContainerTracker{}
+	}
+	containerCache := map[string][]ContainerMetadata{}
+	cleaned := 0
+	skipped := 0
 	for _, sess := range sessions {
 		cleanupCfg := cfg
 		if sess.RemoteTarget != "" {
 			cleanupCfg.RemoteDockerHost = sess.RemoteTarget
 		}
+		containers, ok := containerCache[cleanupCfg.RemoteDockerHost]
+		if !ok {
+			containers, err = tracker.List(ctx, cleanupCfg)
+			if err != nil {
+				return err
+			}
+			containerCache[cleanupCfg.RemoteDockerHost] = containers
+		}
+		if sessionHasContainer(sess, containers) {
+			skipped++
+			continue
+		}
 		if err := a.cleanupSession(ctx, cleanupCfg, sess); err != nil {
 			return err
 		}
+		cleaned++
 	}
-	_, err = fmt.Fprintf(a.output(), "Cleaned %d DockBridge session(s).\n", len(sessions))
+	_, err = fmt.Fprintf(a.output(), "Cleaned %d DockBridge session(s). Skipped %d active DockBridge session(s).\n", cleaned, skipped)
 	return err
 }
 
@@ -1214,6 +1387,18 @@ func isDetachedCompose(args []string) bool {
 					return true
 				}
 			}
+		}
+	}
+	return false
+}
+
+func dockerRunAutoRemove(args []string) bool {
+	for _, arg := range args {
+		switch arg {
+		case "--rm", "--rm=true":
+			return true
+		case "--rm=false":
+			return false
 		}
 	}
 	return false

@@ -25,6 +25,10 @@ type Config struct {
 	MutagenIgnores      []string
 }
 
+func (c Config) IsSSHRemote() bool {
+	return strings.HasPrefix(c.RemoteDockerHost, "ssh://")
+}
+
 type Options struct {
 	Env         map[string]string
 	HomeDir     string
