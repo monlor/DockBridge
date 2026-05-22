@@ -8,7 +8,7 @@ SSH-backed remote Docker hosts.
 The recommended first-run path is the install script:
 
 ```bash
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/monlor/dockbridge/main/install.sh | bash
 ```
 
 The script is optimized for macOS first and includes best-effort Linux support.
@@ -24,7 +24,8 @@ It can:
 Use dry-run mode if you want to preview every command first:
 
 ```bash
-./install.sh --dry-run
+curl -fsSL https://raw.githubusercontent.com/monlor/dockbridge/main/install.sh | \
+  bash -s -- --dry-run
 ```
 
 `--dry-run` prints the install, SSH, and Docker context actions it would take
@@ -48,7 +49,10 @@ Common options:
 Example:
 
 ```bash
-./install.sh --context-name local-dockbridge --output /tmp/onboard.txt
+curl -fsSL https://raw.githubusercontent.com/monlor/dockbridge/main/install.sh | \
+  bash -s -- \
+  --context-name local-dockbridge \
+  --output /tmp/onboard.txt
 ```
 
 During setup, you can either pick an existing Docker context whose Docker host
