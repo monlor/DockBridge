@@ -427,6 +427,49 @@ EOF
   rm -rf "$tmp_dir"
 }
 
+run_stdin_script_uses_separate_prompt_fd_test() {
+  local tmp_dir home_dir bin_dir log_path summary_path local_binary result
+
+  tmp_dir="$(mktemp -d)"
+  home_dir="$tmp_dir/home"
+  bin_dir="$tmp_dir/bin"
+  log_path="$tmp_dir/docker.log"
+  summary_path="$tmp_dir/summary.txt"
+  local_binary="$tmp_dir/dockerbridge"
+
+  mkdir -p "$home_dir/.ssh" "$bin_dir"
+  : > "$home_dir/.ssh/id_ed25519"
+  : > "$log_path"
+
+  make_fake_uname "$bin_dir"
+  make_fake_docker "$bin_dir"
+  make_fake_mutagen "$bin_dir"
+  make_fake_dockbridge_binary "$local_binary"
+
+  result="$(
+    HOME="$home_dir" \
+    PATH="$bin_dir:/usr/bin:/bin:/usr/sbin:/sbin" \
+    DOCKER_LOG="$log_path" \
+    DOCKER_CONTEXT_LS_OUTPUT=$'ssh-prod\ntcp-prod\n' \
+    DOCKBRIDGE_LOCAL_BIN_DIR="$bin_dir" \
+    DOCKBRIDGE_LOCAL_BINARY="$local_binary" \
+    DOCKBRIDGE_PROMPT_FD="3" \
+    perl -e 'alarm 5; exec @ARGV' bash -s -- --skip-docker-check --skip-mutagen --output "$summary_path" 3<<'EOF_INPUT' <<EOF_SCRIPT
+1
+1
+y
+EOF_INPUT
+$(cat "$TARGET_SCRIPT")
+EOF_SCRIPT
+  )"
+
+  assert_contains "$result" "Selected existing SSH Docker context 'ssh-prod'."
+  assert_file_contains "$log_path" "context use ssh-prod"
+  assert_file_contains "$summary_path" "Docker context: ssh-prod"
+
+  rm -rf "$tmp_dir"
+}
+
 main() {
   run_parse_test
   run_dry_run_test
@@ -434,6 +477,7 @@ main() {
   run_shell_alias_persistence_test
   run_interactive_dry_run_does_not_write_files_test
   run_existing_ssh_context_selection_test
+  run_stdin_script_uses_separate_prompt_fd_test
   printf '[pass] install.sh smoke tests passed\n'
 }
 

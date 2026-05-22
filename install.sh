@@ -27,6 +27,7 @@ DOCKBRIDGE_INSTALL_PATH=""
 DOCKBRIDGE_INSTALL_SOURCE="not installed"
 SHELL_ALIAS_STATUS="not needed"
 DOCKER_COMMAND_ALIAS_ENABLED=0
+PROMPT_INPUT_FD=0
 
 log_info() {
   printf '[info] %s\n' "$*"
@@ -126,18 +127,60 @@ assert_dependencies() {
   fi
 }
 
+setup_prompt_input() {
+  if [[ -n "${DOCKBRIDGE_PROMPT_FD:-}" ]]; then
+    if [[ ! "${DOCKBRIDGE_PROMPT_FD}" =~ ^[0-9]+$ ]]; then
+      log_error "DOCKBRIDGE_PROMPT_FD must be a numeric file descriptor."
+      exit 1
+    fi
+    PROMPT_INPUT_FD="${DOCKBRIDGE_PROMPT_FD}"
+    return
+  fi
+
+  if [[ -t 0 ]]; then
+    PROMPT_INPUT_FD=0
+    return
+  fi
+
+  if [[ -t 1 || -t 2 ]] && exec 9</dev/tty 2>/dev/null; then
+    PROMPT_INPUT_FD=9
+    return
+  fi
+
+  PROMPT_INPUT_FD=0
+}
+
+prompt_read() {
+  local prompt="$1"
+
+  if [[ "$PROMPT_INPUT_FD" == "0" ]]; then
+    if read -r -p "$prompt" REPLY; then
+      return 0
+    fi
+  else
+    if read -r -u "$PROMPT_INPUT_FD" -p "$prompt" REPLY; then
+      return 0
+    fi
+  fi
+
+  log_error "Interactive input unavailable. Run this script from a terminal when prompts are required."
+  exit 1
+}
+
 ask() {
   local prompt="$1"
   local default="${2:-}"
   local answer=""
 
   if [[ -n "$default" ]]; then
-    read -r -p "$prompt [$default]: " answer
+    prompt_read "$prompt [$default]: "
+    answer="$REPLY"
     printf '%s\n' "${answer:-$default}"
     return
   fi
 
-  read -r -p "$prompt: " answer
+  prompt_read "$prompt: "
+  answer="$REPLY"
   printf '%s\n' "$answer"
 }
 
@@ -147,7 +190,7 @@ path_contains_dir() {
 }
 
 shell_alias_is_interactive() {
-  [[ "${DOCKBRIDGE_FORCE_INTERACTIVE:-0}" == "1" || -t 0 ]]
+  [[ "${DOCKBRIDGE_FORCE_INTERACTIVE:-0}" == "1" || -t 0 || "$PROMPT_INPUT_FD" != "0" ]]
 }
 
 ask_yes_no() {
@@ -158,10 +201,12 @@ ask_yes_no() {
 
   while true; do
     if [[ "$default" == "y" ]]; then
-      read -r -p "$prompt [Y/n]: " answer
+      prompt_read "$prompt [Y/n]: "
+      answer="$REPLY"
       answer="${answer:-y}"
     else
-      read -r -p "$prompt [y/N]: " answer
+      prompt_read "$prompt [y/N]: "
+      answer="$REPLY"
       answer="${answer:-n}"
     fi
 
@@ -197,7 +242,8 @@ ask_choice() {
       index=$((index + 1))
     done
 
-    read -r -p "Choose [1-${#options[@]}]: " answer
+    prompt_read "Choose [1-${#options[@]}]: "
+    answer="$REPLY"
     if [[ "$answer" =~ ^[0-9]+$ ]] && [[ "$answer" -ge 1 ]] && [[ "$answer" -le "${#options[@]}" ]]; then
       printf '%s\n' "$answer"
       return
@@ -871,7 +917,8 @@ select_existing_ssh_context() {
   done
 
   while true; do
-    read -r -p "Select SSH Docker context [1-${#ssh_context_names[@]}]: " choice
+    prompt_read "Select SSH Docker context [1-${#ssh_context_names[@]}]: "
+    choice="$REPLY"
     if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "${#ssh_context_names[@]}" ]]; then
       break
     fi
@@ -1036,6 +1083,7 @@ main() {
   log_info "Starting DockBridge onboarding for $OS"
 
   assert_dependencies
+  setup_prompt_input
   resolve_platform
   install_docker_cli
   install_mutagen
