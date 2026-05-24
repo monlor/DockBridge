@@ -470,6 +470,42 @@ EOF_SCRIPT
   rm -rf "$tmp_dir"
 }
 
+run_stdin_script_keeps_prompt_output_visible_test() {
+  local tmp_dir home_dir bin_dir log_path local_binary output_path
+
+  tmp_dir="$(mktemp -d)"
+  home_dir="$tmp_dir/home"
+  bin_dir="$tmp_dir/bin"
+  log_path="$tmp_dir/docker.log"
+  local_binary="$tmp_dir/dockerbridge"
+  output_path="$tmp_dir/output.txt"
+
+  mkdir -p "$home_dir/.ssh" "$bin_dir"
+  : > "$home_dir/.ssh/id_ed25519"
+  : > "$log_path"
+
+  make_fake_uname "$bin_dir"
+  make_fake_docker "$bin_dir"
+  make_fake_mutagen "$bin_dir"
+  make_fake_dockbridge_binary "$local_binary"
+
+  set +e
+  HOME="$home_dir" \
+    PATH="$bin_dir:/usr/bin:/bin:/usr/sbin:/sbin" \
+    DOCKER_LOG="$log_path" \
+    DOCKBRIDGE_LOCAL_BIN_DIR="$bin_dir" \
+    DOCKBRIDGE_LOCAL_BINARY="$local_binary" \
+    script -q "$tmp_dir/typescript.log" \
+      bash -lc "timeout 3s bash -s -- --skip-docker-check --skip-mutagen < '$TARGET_SCRIPT'" \
+      > "$output_path" 2>&1
+  set -e
+
+  assert_file_contains "$output_path" "How should DockBridge connect to Docker?"
+  assert_file_contains "$output_path" "Choose [1-2]:"
+
+  rm -rf "$tmp_dir"
+}
+
 main() {
   run_parse_test
   run_dry_run_test
@@ -478,6 +514,7 @@ main() {
   run_interactive_dry_run_does_not_write_files_test
   run_existing_ssh_context_selection_test
   run_stdin_script_uses_separate_prompt_fd_test
+  run_stdin_script_keeps_prompt_output_visible_test
   printf '[pass] install.sh smoke tests passed\n'
 }
 

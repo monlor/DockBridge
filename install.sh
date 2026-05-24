@@ -142,7 +142,7 @@ setup_prompt_input() {
     return
   fi
 
-  if [[ -t 1 || -t 2 ]] && exec 9</dev/tty 2>/dev/null; then
+  if [[ -t 1 || -t 2 ]] && { exec 9</dev/tty; } 2>/dev/null; then
     PROMPT_INPUT_FD=9
     return
   fi
