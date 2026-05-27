@@ -125,6 +125,50 @@ func TestMutagenDriverReusesExistingHealthySession(t *testing.T) {
 	}
 }
 
+func TestMutagenDriverRecreatesExistingSessionWithMissingRemoteRoot(t *testing.T) {
+	runner := &fakeMutagenRunner{
+		existing: true,
+		listMessages: []string{
+			"Transition problems:\n\t<root>: unable to open synchronization root parent directory: no such file or directory\nStatus: Watching for changes\n",
+		},
+	}
+	driver := MutagenDriver{Binary: "mutagen", Runner: runner}
+
+	if _, err := driver.Start(context.Background(), Projection{SessionID: "abc", LocalPath: "/local", RemotePath: "/remote", RemoteHost: "ssh://me@example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	calls := runner.callArgs()
+	for _, want := range [][]string{{"sync", "terminate"}, {"sync", "create"}, {"sync", "flush"}} {
+		if !hasCallPrefix(calls, want) {
+			t.Fatalf("expected call prefix %#v, got %#v", want, calls)
+		}
+	}
+}
+
+func TestMutagenDriverRecreatesStaleSessionWhenFlushCannotSynchronize(t *testing.T) {
+	runner := &fakeMutagenRunner{
+		existing: true,
+		failOn:   "flush",
+		failOnce: true,
+		message:  "unable to flush session: session is not currently able to synchronize",
+		listMessages: []string{
+			"Status: Watching for changes\nIdentifier: sync_abc\n",
+			"Transition problems:\n\t<root>: unable to open synchronization root parent directory: no such file or directory\nStatus: Watching for changes\n",
+		},
+	}
+	driver := MutagenDriver{Binary: "mutagen", Runner: runner}
+
+	if _, err := driver.Start(context.Background(), Projection{SessionID: "abc", LocalPath: "/local", RemotePath: "/remote", RemoteHost: "ssh://me@example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	calls := runner.callArgs()
+	for _, want := range [][]string{{"sync", "list", "--long"}, {"sync", "terminate"}, {"sync", "create"}, {"sync", "flush"}} {
+		if !hasCallPrefix(calls, want) {
+			t.Fatalf("expected call prefix %#v, got %#v", want, calls)
+		}
+	}
+}
+
 func TestMutagenDriverFailsBeforeReadyWhenCommandFails(t *testing.T) {
 	runner := &fakeMutagenRunner{failOn: "flush"}
 	driver := MutagenDriver{Binary: "mutagen", Runner: runner}
@@ -135,24 +179,38 @@ func TestMutagenDriverFailsBeforeReadyWhenCommandFails(t *testing.T) {
 }
 
 func TestMutagenDriverExplainsMacOSPrivacyDenial(t *testing.T) {
-	runner := &fakeMutagenRunner{
-		failOn:  "flush",
-		message: "alpha scan error: unable to open synchronization root: operation not permitted",
-	}
-	driver := MutagenDriver{Binary: "mutagen", Runner: runner}
-	_, err := driver.Start(context.Background(), Projection{
-		SessionID:  "abc",
-		LocalPath:  "/Users/monlor/Downloads",
-		RemotePath: "/remote",
-		RemoteHost: "ssh://me@example.com",
-	})
-	if err == nil {
-		t.Fatal("expected Mutagen privacy denial error")
-	}
-	for _, want := range []string{"/Users/monlor/Downloads", "macOS privacy", "Full Disk Access", "mutagen daemon stop"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("expected error to contain %q, got %v", want, err)
-		}
+	for _, failOn := range []string{"sync create", "flush", "status"} {
+		t.Run(failOn, func(t *testing.T) {
+			runner := &fakeMutagenRunner{
+				failOn:  failOn,
+				message: "alpha scan error: unable to open synchronization root: operation not permitted",
+			}
+			if failOn == "status" {
+				runner.existing = true
+				runner.failOn = ""
+				runner.listMessage = "Status: Waiting 5 seconds for rescan\nLast error: alpha scan error: unable to open synchronization root: operation not permitted\nIdentifier: sync_abc\n"
+			}
+			driver := MutagenDriver{Binary: "mutagen", Runner: runner}
+			_, err := driver.Start(context.Background(), Projection{
+				SessionID:  "abc",
+				LocalPath:  "/Users/monlor/Downloads",
+				RemotePath: "/remote",
+				RemoteHost: "ssh://me@example.com",
+			})
+			if err == nil {
+				t.Fatal("expected Mutagen privacy denial error")
+			}
+			for _, want := range []string{"/Users/monlor/Downloads", "macOS privacy", "Full Disk Access", "mutagen daemon stop"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("expected error to contain %q, got %v", want, err)
+				}
+			}
+			for _, call := range runner.callArgs() {
+				if failOn == "status" && hasPrefix(call, []string{"sync", "flush"}) {
+					t.Fatalf("status access denial should fail before flush, got calls %#v", runner.callArgs())
+				}
+			}
+		})
 	}
 }
 
@@ -177,16 +235,22 @@ func TestExecMutagenRunnerIncludesCommandOutputInErrors(t *testing.T) {
 }
 
 type fakeMutagenRunner struct {
-	calls    []mutagenCommand
-	existing bool
-	failOn   string
-	message  string
+	calls        []mutagenCommand
+	existing     bool
+	failOn       string
+	failOnce     bool
+	message      string
+	listMessage  string
+	listMessages []string
 }
 
 func (f *fakeMutagenRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
 	f.calls = append(f.calls, mutagenCommand{Name: name, Args: append([]string{}, args...)})
 	joined := strings.Join(args, " ")
 	if f.failOn != "" && strings.Contains(joined, f.failOn) {
+		if f.failOnce {
+			f.failOn = ""
+		}
 		if f.message != "" {
 			return []byte(f.message), errors.New(f.message)
 		}
@@ -194,6 +258,14 @@ func (f *fakeMutagenRunner) Run(_ context.Context, name string, args ...string) 
 	}
 	if reflect.DeepEqual(args[:min(2, len(args))], []string{"sync", "list"}) {
 		if f.existing || len(f.calls) > 3 {
+			if len(f.listMessages) > 0 {
+				message := f.listMessages[0]
+				f.listMessages = f.listMessages[1:]
+				return []byte(message), nil
+			}
+			if f.listMessage != "" {
+				return []byte(f.listMessage), nil
+			}
 			return []byte("Status: Watching for changes\nIdentifier: sync_abc\n"), nil
 		}
 		return nil, errors.New("not found")
@@ -219,6 +291,15 @@ func hasPrefix(values, prefix []string) bool {
 		}
 	}
 	return true
+}
+
+func hasCallPrefix(calls [][]string, prefix []string) bool {
+	for _, call := range calls {
+		if hasPrefix(call, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func contains(values []string, want string) bool {

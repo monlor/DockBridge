@@ -101,6 +101,11 @@ alias dockerbridge="$HOME/.local/bin/dockerbridge"
   `dockerbridge --version`
 - If mutagen was installed into `~/.local/bin`, add it to PATH:
   `export PATH="$HOME/.local/bin:$PATH"`
+- If macOS blocks a protected bind mount such as `~/Downloads`, grant Full
+  Disk Access or Files and Folders access to the terminal app running
+  `dockerbridge`. If Mutagen still reports access denied, grant access to
+  Mutagen if it appears in System Settings -> Privacy & Security, then run
+  `mutagen daemon stop` and retry.
 - If SSH reachability fails, verify:
   - remote host reachable
   - key path is correct

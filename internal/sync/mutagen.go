@@ -67,21 +67,59 @@ func (d MutagenDriver) Start(ctx context.Context, projection Projection) (Sessio
 	if err != nil {
 		createArgs := mutagenCreateArgs(name, mode, d.Ignores, projection.LocalPath, endpoint)
 		if _, err := runner.Run(ctx, binary, createArgs...); err != nil {
+			if IsLocalAccessDenied(err) {
+				return nil, fmt.Errorf("%s: %w", LocalAccessDeniedMessage(projection.LocalPath), err)
+			}
 			return nil, fmt.Errorf("Mutagen session creation failed for %s: %w", projection.LocalPath, err)
+		}
+	} else if IsLocalAccessDeniedOutput(statusOutput) {
+		return nil, fmt.Errorf("%s", LocalAccessDeniedMessage(projection.LocalPath))
+	} else if isStaleMutagenRoot(statusOutput) {
+		if err := recreateMutagenSession(ctx, runner, binary, name, mode, d.Ignores, projection.LocalPath, endpoint); err != nil {
+			return nil, err
 		}
 	}
 	if _, err := runner.Run(ctx, binary, "sync", "flush", name); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		if IsLocalAccessDenied(err) {
 			return nil, fmt.Errorf("%s: %w", LocalAccessDeniedMessage(projection.LocalPath), err)
 		}
-		return nil, fmt.Errorf("Mutagen readiness failed for %s during flush: %w", projection.LocalPath, err)
+		recovered := false
+		if isMutagenUnableToSynchronize(err) {
+			statusOutput, statusErr := runner.Run(ctx, binary, "sync", "list", "--long", name)
+			if statusErr == nil {
+				if IsLocalAccessDeniedOutput(statusOutput) {
+					return nil, fmt.Errorf("%s", LocalAccessDeniedMessage(projection.LocalPath))
+				}
+				if isStaleMutagenRoot(statusOutput) {
+					if err := recreateMutagenSession(ctx, runner, binary, name, mode, d.Ignores, projection.LocalPath, endpoint); err != nil {
+						return nil, err
+					}
+					if _, err := runner.Run(ctx, binary, "sync", "flush", name); err != nil {
+						return nil, fmt.Errorf("Mutagen readiness failed for %s during flush after recreating stale session: %w", projection.LocalPath, err)
+					}
+					recovered = true
+				}
+			}
+		}
+		if !recovered {
+			return nil, fmt.Errorf("Mutagen readiness failed for %s during flush: %w", projection.LocalPath, err)
+		}
 	}
 	statusOutput, err = runner.Run(ctx, binary, "sync", "list", name)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		if IsLocalAccessDenied(err) {
 			return nil, fmt.Errorf("%s: %w", LocalAccessDeniedMessage(projection.LocalPath), err)
 		}
 		return nil, fmt.Errorf("Mutagen readiness failed for %s during status: %w", projection.LocalPath, err)
+	}
+	if IsLocalAccessDeniedOutput(statusOutput) {
+		return nil, fmt.Errorf("%s", LocalAccessDeniedMessage(projection.LocalPath))
 	}
 
 	status := newStatus(projection)
@@ -92,6 +130,31 @@ func (d MutagenDriver) Start(ctx context.Context, projection Projection) (Sessio
 	status.RemoteEndpoint = endpoint
 	status.LastStatus = parseMutagenStatus(string(statusOutput))
 	return &mutagenSession{binary: binary, runner: runner, status: status}, nil
+}
+
+func recreateMutagenSession(ctx context.Context, runner MutagenRunner, binary, name, mode string, ignores []string, localPath, endpoint string) error {
+	if _, err := runner.Run(ctx, binary, "sync", "terminate", name); err != nil {
+		return fmt.Errorf("Mutagen stale session cleanup failed for %s: %w", localPath, err)
+	}
+	createArgs := mutagenCreateArgs(name, mode, ignores, localPath, endpoint)
+	if _, err := runner.Run(ctx, binary, createArgs...); err != nil {
+		if IsLocalAccessDenied(err) {
+			return fmt.Errorf("%s: %w", LocalAccessDeniedMessage(localPath), err)
+		}
+		return fmt.Errorf("Mutagen session recreation failed for %s: %w", localPath, err)
+	}
+	return nil
+}
+
+func isMutagenUnableToSynchronize(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "not currently able to synchronize")
+}
+
+func isStaleMutagenRoot(output []byte) bool {
+	message := strings.ToLower(string(output))
+	return strings.Contains(message, "transition problems") &&
+		strings.Contains(message, "unable to open synchronization root parent directory") &&
+		strings.Contains(message, "no such file or directory")
 }
 
 type mutagenSession struct {

@@ -621,7 +621,16 @@ func TestDockerbridgeSessionsListsTrackedSessions(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	a := App{Executor: &RecordingExecutor{}, SessionStore: store, Output: &out}
+	a := App{
+		Executor:     &RecordingExecutor{},
+		SessionStore: store,
+		Output:       &out,
+		ContainerTracker: recordingContainerTracker{containers: []ContainerMetadata{{
+			ID:         "container-1234567890abcdef",
+			Name:       "nginx",
+			MountPaths: []string{"/srv/dockbridge/sess-a/Downloads"},
+		}}},
+	}
 	err := a.Run(context.Background(), Invocation{
 		Entrypoint: "dockerbridge",
 		Args:       []string{"sessions"},
@@ -637,10 +646,84 @@ func TestDockerbridgeSessionsListsTrackedSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := out.String()
-	for _, want := range []string{"ID", "LOCAL ROOT", "REMOTE", "WORKSPACE", "SYNCS", "TUNNELS", "sess-a", "1/2", "1/1"} {
+	for _, want := range []string{"ID", "LOCAL ROOT", "REMOTE", "WORKSPACE", "SYNCS", "TUNNELS", "CONTAINERS", "sess-a", "1/2", "1/1", "nginx:container-12"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("session list missing %q in:\n%s", want, got)
 		}
+	}
+}
+
+func TestDockerbridgeSessionsListsContainersPerRemote(t *testing.T) {
+	state := t.TempDir()
+	store := session.NewStore(state)
+	for _, sess := range []session.Session{
+		{
+			ID:              "sess-a",
+			LocalRoot:       "/Users/me/project-a",
+			RemoteTarget:    "ssh://dev-a",
+			RemoteWorkspace: "/srv/dockbridge/sess-a",
+		},
+		{
+			ID:              "sess-b",
+			LocalRoot:       "/Users/me/project-b",
+			RemoteTarget:    "ssh://dev-b",
+			RemoteWorkspace: "/srv/dockbridge/sess-b",
+		},
+	} {
+		if err := store.Save(sess); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var out bytes.Buffer
+	a := App{
+		SessionStore: store,
+		Output:       &out,
+		ContainerTracker: remoteContainerTracker{containers: map[string][]ContainerMetadata{
+			"ssh://dev-a": {{
+				ID:         "container-a1234567890",
+				Name:       "web-a",
+				MountPaths: []string{"/srv/dockbridge/sess-a"},
+			}},
+			"ssh://dev-b": {{
+				ID:         "container-b1234567890",
+				Name:       "web-b",
+				MountPaths: []string{"/srv/dockbridge/sess-b"},
+			}},
+		}},
+	}
+	err := a.Run(context.Background(), Invocation{
+		Entrypoint: "dockerbridge",
+		Args:       []string{"sessions"},
+		Env:        map[string]string{},
+		Config: config.Config{
+			RealDockerPath:      "/bin/docker",
+			RemoteDockerHost:    "ssh://dev-a",
+			StateDir:            state,
+			RemoteWorkspaceRoot: "/srv/dockbridge",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{"web-a:container-a1", "web-b:container-b1"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("session list missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+func TestContainerSummaryKeepsSessionListCompact(t *testing.T) {
+	got := containerSummary([]ContainerMetadata{
+		{ID: "container-a1234567890", Name: "web"},
+		{ID: "container-b1234567890", Name: "worker"},
+		{ID: "container-c1234567890", Name: "db"},
+		{ID: "container-d1234567890", Name: "cache"},
+	})
+	want := "web:container-a1,worker:container-b1,db:container-c1,+1 more"
+	if got != want {
+		t.Fatalf("containerSummary = %q, want %q", got, want)
 	}
 }
 
@@ -2023,6 +2106,83 @@ func TestDockerRunChecksLocalMountAccessBeforeSync(t *testing.T) {
 	}
 }
 
+func TestComposeUpChecksLocalMountAccessBeforeSync(t *testing.T) {
+	cwd := t.TempDir()
+	state := t.TempDir()
+	composeFile := filepath.Join(cwd, "compose.yml")
+	if err := os.WriteFile(composeFile, []byte("services:\n  web:\n    image: nginx\n    volumes:\n      - /Users/monlor/Downloads:/data\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RecordingExecutor{}
+	syncDriver := &recordingSyncDriver{}
+	a := App{
+		Executor:     exec,
+		SyncDriver:   syncDriver,
+		SessionStore: session.NewStore(state),
+		LocalPathChecker: func(path string) error {
+			if strings.Contains(path, "Downloads") {
+				return &os.PathError{Op: "open", Path: path, Err: syscall.EPERM}
+			}
+			return nil
+		},
+	}
+	err := a.Run(context.Background(), Invocation{
+		Entrypoint: "docker",
+		Args:       []string{"compose", "up"},
+		Env:        map[string]string{},
+		Cwd:        cwd,
+		Config: config.Config{
+			RealDockerPath:      "/bin/docker",
+			RemoteDockerHost:    "ssh://dev",
+			StateDir:            state,
+			LocalBindAddress:    "127.0.0.1",
+			RemoteWorkspaceRoot: "/remote",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected local mount access error")
+	}
+	for _, want := range []string{"/Users/monlor/Downloads", "macOS privacy", "Full Disk Access", "mutagen daemon stop"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected error to contain %q, got %v", want, err)
+		}
+	}
+	if len(syncDriver.projections) != 0 {
+		t.Fatalf("sync should not start after local access failure: %+v", syncDriver.projections)
+	}
+	if len(exec.Calls) != 0 {
+		t.Fatalf("docker should not run after local access failure: %+v", exec.Calls)
+	}
+}
+
+func TestStartSyncsCleansStartedSyncWhenLaterLocalAccessFails(t *testing.T) {
+	syncDriver := &recordingSyncDriver{status: dbsync.Status{Active: true}}
+	checks := 0
+	a := App{
+		SyncDriver: syncDriver,
+		LocalPathChecker: func(path string) error {
+			checks++
+			if checks == 2 {
+				return &os.PathError{Op: "open", Path: path, Err: syscall.EPERM}
+			}
+			return nil
+		},
+	}
+	_, err := a.startSyncs(context.Background(), "abc", config.Config{RemoteDockerHost: "ssh://dev"}, map[string]string{
+		"/allowed": "/remote/allowed",
+		"/blocked": "/remote/blocked",
+	})
+	if err == nil {
+		t.Fatal("expected local mount access error")
+	}
+	if len(syncDriver.projections) != 1 {
+		t.Fatalf("expected one sync to start before later access failure, got %+v", syncDriver.projections)
+	}
+	if syncDriver.stops != 1 {
+		t.Fatalf("expected started sync to be stopped, got %d", syncDriver.stops)
+	}
+}
+
 func TestOSExecutorAndEnvMap(t *testing.T) {
 	if err := (OSExecutor{}).Run(context.Background(), Call{Name: "/bin/echo", Args: []string{"ok"}}); err != nil {
 		t.Fatal(err)
@@ -2297,6 +2457,14 @@ type recordingContainerTracker struct {
 
 func (r recordingContainerTracker) List(_ context.Context, _ config.Config) ([]ContainerMetadata, error) {
 	return r.containers, r.err
+}
+
+type remoteContainerTracker struct {
+	containers map[string][]ContainerMetadata
+}
+
+func (r remoteContainerTracker) List(_ context.Context, cfg config.Config) ([]ContainerMetadata, error) {
+	return r.containers[cfg.RemoteDockerHost], nil
 }
 
 type cancelingExecutor struct {

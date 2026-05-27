@@ -63,6 +63,20 @@ func TestSSHRsyncDriverReportsCommandErrors(t *testing.T) {
 	}
 }
 
+func TestIsLocalAccessDeniedClassifiesMutagenRootAccessError(t *testing.T) {
+	output := []byte("alpha scan error: unable to open synchronization root: scan failed")
+	if !IsLocalAccessDeniedOutput(output) {
+		t.Fatal("expected synchronization root access error to be classified as local access denied")
+	}
+}
+
+func TestIsLocalAccessDeniedDoesNotClassifyStaleRemoteRoot(t *testing.T) {
+	output := []byte("Transition problems:\n\t<root>: unable to open synchronization root parent directory: no such file or directory\n")
+	if IsLocalAccessDeniedOutput(output) {
+		t.Fatal("stale remote root should not be classified as local access denied")
+	}
+}
+
 func TestSSHRsyncDriverLifecycleWithInjectedRunner(t *testing.T) {
 	calls := 0
 	driver := SSHRsyncDriver{

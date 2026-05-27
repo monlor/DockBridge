@@ -278,9 +278,24 @@ func IsLocalAccessDenied(err error) bool {
 	if errors.Is(err, os.ErrPermission) {
 		return true
 	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "operation not permitted") ||
-		strings.Contains(message, "unable to open synchronization root")
+	return isLocalAccessDeniedText(err.Error())
+}
+
+func IsLocalAccessDeniedOutput(output []byte) bool {
+	return isLocalAccessDeniedText(string(output))
+}
+
+func isLocalAccessDeniedText(text string) bool {
+	message := strings.ToLower(text)
+	if strings.Contains(message, "operation not permitted") ||
+		strings.Contains(message, "permission denied") {
+		return true
+	}
+	if strings.Contains(message, "unable to open synchronization root") {
+		return !strings.Contains(message, "unable to open synchronization root parent directory") ||
+			!strings.Contains(message, "no such file or directory")
+	}
+	return false
 }
 
 func LocalAccessDeniedMessage(localPath string) string {

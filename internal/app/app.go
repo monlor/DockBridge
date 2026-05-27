@@ -171,6 +171,7 @@ type ContainerTracker interface {
 
 type ContainerMetadata struct {
 	ID             string
+	Name           string
 	MountPaths     []string
 	PublishedPorts []int
 }
@@ -383,9 +384,6 @@ func (a App) runDockerRun(ctx context.Context, executor Executor, inv Invocation
 		if mount.IsNamedVolume || mount.Source == "" {
 			continue
 		}
-		if err := a.checkLocalMountAccess(mount.Source); err != nil {
-			return err
-		}
 		remote := filepath.ToSlash(filepath.Join(sess.RemoteWorkspace, filepath.Base(mount.Source)))
 		pathMappings[mount.Source] = remote
 	}
@@ -518,6 +516,10 @@ func (a App) startSyncs(ctx context.Context, sessionID string, cfg config.Config
 	}
 	started := make([]startedSync, 0, len(mappings))
 	for local, remote := range mappings {
+		if err := a.checkLocalMountAccess(local); err != nil {
+			_ = a.stopStartedSyncs(ctx, started)
+			return nil, err
+		}
 		syncSession, err := a.SyncDriver.Start(ctx, dbsync.Projection{SessionID: sessionID, LocalPath: local, RemotePath: remote, RemoteHost: cfg.RemoteDockerHost})
 		if err != nil {
 			_ = a.stopStartedSyncs(ctx, started)
@@ -745,6 +747,7 @@ func (DockerContainerTracker) List(ctx context.Context, cfg config.Config) ([]Co
 	}
 	var records []struct {
 		ID     string `json:"Id"`
+		Name   string `json:"Name"`
 		Mounts []struct {
 			Source string `json:"Source"`
 		} `json:"Mounts"`
@@ -759,7 +762,7 @@ func (DockerContainerTracker) List(ctx context.Context, cfg config.Config) ([]Co
 	}
 	containers := make([]ContainerMetadata, 0, len(records))
 	for _, record := range records {
-		meta := ContainerMetadata{ID: record.ID}
+		meta := ContainerMetadata{ID: record.ID, Name: strings.TrimPrefix(record.Name, "/")}
 		for _, mount := range record.Mounts {
 			if mount.Source != "" {
 				meta.MountPaths = append(meta.MountPaths, filepath.ToSlash(path.Clean(mount.Source)))
@@ -779,6 +782,10 @@ func (DockerContainerTracker) List(ctx context.Context, cfg config.Config) ([]Co
 }
 
 func sessionHasContainer(sess session.Session, containers []ContainerMetadata) bool {
+	return len(sessionContainers(sess, containers)) > 0
+}
+
+func sessionContainers(sess session.Session, containers []ContainerMetadata) []ContainerMetadata {
 	remotePaths := make([]string, 0, len(sess.Syncs)+1)
 	if sess.RemoteWorkspace != "" {
 		remotePaths = append(remotePaths, filepath.ToSlash(path.Clean(sess.RemoteWorkspace)))
@@ -795,21 +802,33 @@ func sessionHasContainer(sess session.Session, containers []ContainerMetadata) b
 			remotePorts[tunnel.RemotePort] = struct{}{}
 		}
 	}
+	var matches []ContainerMetadata
 	for _, container := range containers {
+		matched := false
 		for _, mountPath := range container.MountPaths {
 			for _, remotePath := range remotePaths {
 				if mountPath == remotePath || strings.HasPrefix(mountPath, remotePath+"/") {
-					return true
+					matched = true
+					break
+				}
+			}
+			if matched {
+				break
+			}
+		}
+		if !matched {
+			for _, publishedPort := range container.PublishedPorts {
+				if _, ok := remotePorts[publishedPort]; ok {
+					matched = true
+					break
 				}
 			}
 		}
-		for _, publishedPort := range container.PublishedPorts {
-			if _, ok := remotePorts[publishedPort]; ok {
-				return true
-			}
+		if matched {
+			matches = append(matches, container)
 		}
 	}
-	return false
+	return matches
 }
 
 func (a App) suspendStartedResources(sess *session.Session, syncs []startedSync, tunnels []ports.Tunnel) error {
@@ -1015,7 +1034,7 @@ func (a App) runNativeSessions(ctx context.Context, inv Invocation) error {
 		return errors.New("dockerbridge sessions requires an ssh:// Docker host")
 	}
 	if len(inv.Args) == 1 || inv.Args[1] == "list" {
-		return a.listSessions()
+		return a.listSessions(ctx, inv.Config)
 	}
 	if inv.Args[1] == "cleanup" {
 		return a.cleanupSessions(ctx, inv.Config)
@@ -1036,7 +1055,7 @@ Commands:
 	return err
 }
 
-func (a App) listSessions() error {
+func (a App) listSessions(ctx context.Context, cfg config.Config) error {
 	sessions, err := a.SessionStore.List()
 	if err != nil {
 		return err
@@ -1046,18 +1065,33 @@ func (a App) listSessions() error {
 		_, err := fmt.Fprintln(out, "No DockBridge sessions.")
 		return err
 	}
+	tracker := a.ContainerTracker
+	if tracker == nil {
+		tracker = DockerContainerTracker{}
+	}
+	containerCache := map[string][]ContainerMetadata{}
 	writer := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	if _, err := fmt.Fprintln(writer, "ID\tLOCAL ROOT\tREMOTE\tWORKSPACE\tSYNCS active/total\tTUNNELS active/total\tUPDATED"); err != nil {
+	if _, err := fmt.Fprintln(writer, "ID\tLOCAL ROOT\tREMOTE\tWORKSPACE\tSYNCS active/total\tTUNNELS active/total\tCONTAINERS\tUPDATED"); err != nil {
 		return err
 	}
 	for _, sess := range sessions {
-		if _, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		listCfg := cfg
+		if sess.RemoteTarget != "" {
+			listCfg.RemoteDockerHost = sess.RemoteTarget
+		}
+		containers, ok := containerCache[listCfg.RemoteDockerHost]
+		if !ok {
+			containers, _ = tracker.List(ctx, listCfg)
+			containerCache[listCfg.RemoteDockerHost] = containers
+		}
+		if _, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			sess.ID,
 			sess.LocalRoot,
 			sess.RemoteTarget,
 			sess.RemoteWorkspace,
 			syncSummary(sess.Syncs),
 			tunnelSummary(sess.Tunnels),
+			containerSummary(sessionContainers(sess, containers)),
 			formatUpdatedAt(sess.UpdatedAt),
 		); err != nil {
 			return err
@@ -1285,6 +1319,37 @@ func tunnelSummary(tunnels []session.TunnelState) string {
 		}
 	}
 	return fmt.Sprintf("%d/%d", active, len(tunnels))
+}
+
+func containerSummary(containers []ContainerMetadata) string {
+	if len(containers) == 0 {
+		return "-"
+	}
+	const limit = 3
+	visible := containers
+	if len(visible) > limit {
+		visible = visible[:limit]
+	}
+	parts := make([]string, 0, len(visible)+1)
+	for _, container := range visible {
+		label := container.Name
+		if label == "" {
+			label = "container"
+		}
+		id := container.ID
+		if len(id) > 12 {
+			id = id[:12]
+		}
+		if id == "" {
+			parts = append(parts, label)
+			continue
+		}
+		parts = append(parts, label+":"+id)
+	}
+	if extra := len(containers) - len(visible); extra > 0 {
+		parts = append(parts, fmt.Sprintf("+%d more", extra))
+	}
+	return strings.Join(parts, ",")
 }
 
 func formatUpdatedAt(updated time.Time) string {
