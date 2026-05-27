@@ -131,6 +131,7 @@ type App struct {
 	ContainerTracker   ContainerTracker
 	Output             io.Writer
 	MutagenTerminator  func(context.Context, string, string) error
+	LocalPathChecker   func(string) error
 	PortAvailable      func(string, int) bool
 	RemotePortStart    int
 }
@@ -382,6 +383,9 @@ func (a App) runDockerRun(ctx context.Context, executor Executor, inv Invocation
 		if mount.IsNamedVolume || mount.Source == "" {
 			continue
 		}
+		if err := a.checkLocalMountAccess(mount.Source); err != nil {
+			return err
+		}
 		remote := filepath.ToSlash(filepath.Join(sess.RemoteWorkspace, filepath.Base(mount.Source)))
 		pathMappings[mount.Source] = remote
 	}
@@ -468,6 +472,44 @@ func (a App) ensureSession(inv Invocation, localRoot string) session.Session {
 		RemoteTarget:    inv.Config.RemoteDockerHost,
 		RemoteWorkspace: session.WorkspacePath(inv.Config.RemoteWorkspaceRoot, id),
 	}
+}
+
+func (a App) checkLocalMountAccess(localPath string) error {
+	checker := a.LocalPathChecker
+	if checker == nil {
+		checker = checkLocalPathAccess
+	}
+	if err := checker(localPath); err != nil {
+		if dbsync.IsLocalAccessDenied(err) {
+			return fmt.Errorf("%s: %w", dbsync.LocalAccessDeniedMessage(localPath), err)
+		}
+		return err
+	}
+	return nil
+}
+
+func checkLocalPathAccess(localPath string) error {
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		file, err := os.Open(localPath)
+		if err != nil {
+			return err
+		}
+		return file.Close()
+	}
+	dir, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	_, err = dir.ReadDir(1)
+	if err == io.EOF {
+		return nil
+	}
+	return err
 }
 
 func (a App) startSyncs(ctx context.Context, sessionID string, cfg config.Config, mappings map[string]string) ([]startedSync, error) {

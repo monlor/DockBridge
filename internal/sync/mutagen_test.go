@@ -134,6 +134,28 @@ func TestMutagenDriverFailsBeforeReadyWhenCommandFails(t *testing.T) {
 	}
 }
 
+func TestMutagenDriverExplainsMacOSPrivacyDenial(t *testing.T) {
+	runner := &fakeMutagenRunner{
+		failOn:  "flush",
+		message: "alpha scan error: unable to open synchronization root: operation not permitted",
+	}
+	driver := MutagenDriver{Binary: "mutagen", Runner: runner}
+	_, err := driver.Start(context.Background(), Projection{
+		SessionID:  "abc",
+		LocalPath:  "/Users/monlor/Downloads",
+		RemotePath: "/remote",
+		RemoteHost: "ssh://me@example.com",
+	})
+	if err == nil {
+		t.Fatal("expected Mutagen privacy denial error")
+	}
+	for _, want := range []string{"/Users/monlor/Downloads", "macOS privacy", "Full Disk Access", "mutagen daemon stop"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected error to contain %q, got %v", want, err)
+		}
+	}
+}
+
 func TestMutagenAvailabilityFailure(t *testing.T) {
 	runner := &fakeMutagenRunner{failOn: "version"}
 	driver := MutagenDriver{Binary: "missing-mutagen", Runner: runner}
@@ -158,12 +180,16 @@ type fakeMutagenRunner struct {
 	calls    []mutagenCommand
 	existing bool
 	failOn   string
+	message  string
 }
 
 func (f *fakeMutagenRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
 	f.calls = append(f.calls, mutagenCommand{Name: name, Args: append([]string{}, args...)})
 	joined := strings.Join(args, " ")
 	if f.failOn != "" && strings.Contains(joined, f.failOn) {
+		if f.message != "" {
+			return []byte(f.message), errors.New(f.message)
+		}
 		return nil, errors.New("boom")
 	}
 	if reflect.DeepEqual(args[:min(2, len(args))], []string{"sync", "list"}) {

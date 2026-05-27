@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1978,6 +1979,47 @@ func TestSyncFailureStopsBeforeDocker(t *testing.T) {
 	}
 	if len(exec.Calls) != 0 {
 		t.Fatalf("docker should not be invoked after sync failure: %+v", exec.Calls)
+	}
+}
+
+func TestDockerRunChecksLocalMountAccessBeforeSync(t *testing.T) {
+	exec := &RecordingExecutor{}
+	syncDriver := &recordingSyncDriver{}
+	a := App{
+		Executor:   exec,
+		SyncDriver: syncDriver,
+		LocalPathChecker: func(path string) error {
+			if strings.Contains(path, "Downloads") {
+				return &os.PathError{Op: "open", Path: path, Err: syscall.EPERM}
+			}
+			return nil
+		},
+	}
+	err := a.Run(context.Background(), Invocation{
+		Entrypoint: "docker",
+		Args:       []string{"run", "-v", "/Users/monlor/Downloads:/tmp", "nginx"},
+		Env:        map[string]string{},
+		Cwd:        t.TempDir(),
+		Config: config.Config{
+			RealDockerPath:      "/bin/docker",
+			RemoteDockerHost:    "ssh://dev",
+			LocalBindAddress:    "127.0.0.1",
+			RemoteWorkspaceRoot: "/remote",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected local mount access error")
+	}
+	for _, want := range []string{"/Users/monlor/Downloads", "macOS privacy", "Full Disk Access", "mutagen daemon stop"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected error to contain %q, got %v", want, err)
+		}
+	}
+	if len(syncDriver.projections) != 0 {
+		t.Fatalf("sync should not start after local access failure: %+v", syncDriver.projections)
+	}
+	if len(exec.Calls) != 0 {
+		t.Fatalf("docker should not run after local access failure: %+v", exec.Calls)
 	}
 }
 

@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -268,4 +269,23 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	defer out.Close()
 	_, err = io.Copy(out, in)
 	return err
+}
+
+func IsLocalAccessDenied(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrPermission) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "operation not permitted") ||
+		strings.Contains(message, "unable to open synchronization root")
+}
+
+func LocalAccessDeniedMessage(localPath string) string {
+	return fmt.Sprintf(
+		"macOS privacy blocked access to %s. Grant Full Disk Access, or Files and Folders access for Downloads/Desktop/Documents, to the terminal app running dockerbridge and to Mutagen if it appears in System Settings -> Privacy & Security. Then run `mutagen daemon stop` and retry.",
+		localPath,
+	)
 }

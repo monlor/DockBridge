@@ -71,10 +71,16 @@ func (d MutagenDriver) Start(ctx context.Context, projection Projection) (Sessio
 		}
 	}
 	if _, err := runner.Run(ctx, binary, "sync", "flush", name); err != nil {
+		if IsLocalAccessDenied(err) {
+			return nil, fmt.Errorf("%s: %w", LocalAccessDeniedMessage(projection.LocalPath), err)
+		}
 		return nil, fmt.Errorf("Mutagen readiness failed for %s during flush: %w", projection.LocalPath, err)
 	}
 	statusOutput, err = runner.Run(ctx, binary, "sync", "list", name)
 	if err != nil {
+		if IsLocalAccessDenied(err) {
+			return nil, fmt.Errorf("%s: %w", LocalAccessDeniedMessage(projection.LocalPath), err)
+		}
 		return nil, fmt.Errorf("Mutagen readiness failed for %s during status: %w", projection.LocalPath, err)
 	}
 
